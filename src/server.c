@@ -1,12 +1,17 @@
+#define _POSIX_C_SOURCE 199309L
+#define _XOPEN_SOURCE 500
+
 #include <sys/socket.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <stddef.h>
+#include <sys/wait.h>
 
 #define SERVER_ROOT "/home/dzmitry/Desktop/serverRoot"
 
@@ -14,6 +19,7 @@ struct connectionData {
     int working;
     int sockfd;
     char path[2048];
+    char realpath[2048];
 };
 
 int sockfd;
@@ -41,11 +47,60 @@ void handleMessage(struct connectionData *data, char *message) {
     if (startsWith(message, "ECHO")) {
         write(data->sockfd, args, strlen(args));
         printf("Sent ECHO: %s\n", args);
+        return;
     }
     if (startsWith(message, "QUIT")) {
-        char *message = "Bye bye.";
-        write(data->sockfd, message, strlen(message));
+        char *msg = "Bye bye.";
+        write(data->sockfd, msg, strlen(msg));
         data->working = 0;
+        printf("Said good bye to %d\n", data->sockfd);
+        return;
+    }
+    if (startsWith(message, "INFO")) {
+        char *msg = "Hello, im a server!\n";
+        write(data->sockfd, msg, strlen(msg));
+        printf("Gave info to %d\n", data->sockfd);
+        return;
+    }
+    if (startsWith(message, "CD")) {
+        if (startsWith("/", args)) {
+            strcpy(data->realpath, SERVER_ROOT);
+            strcpy(data->path, "/");
+        } else {
+            char new[1024];
+            strcpy(new, data->realpath);
+            strcat(new, "/");
+            strcat(new, args);
+
+            char path[1024];
+            realpath(new, path);
+            
+            if (startsWith(path, SERVER_ROOT)) {
+                strcpy(data->realpath, path);
+                strcpy(data->path, path + strlen(SERVER_ROOT));
+                strcat(data->path, "/");
+            }
+        }
+        printf("Current dir for %d user is %s\n", data->sockfd, data->realpath);
+        return;
+    }
+    if (startsWith(message, "LIST")) {
+        printf("Current dir for %d user is %s\n", data->sockfd, data->realpath);
+        FILE *fp;
+        char command[1024];
+        char buffer[1024];
+        strcpy(command, "/bin/ls -lah ");
+        strcat(command, data->realpath);
+        fp = popen(command, "r");
+        if (fp == NULL) {
+            fprintf(stderr, "Failed to run ls");
+        }
+        while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+            write(data->sockfd, buffer, strlen(buffer));
+        }
+        pclose(fp);
+        printf("Successful LIST for user %d\n", data->sockfd);
+        return;
     }
 }
 
@@ -58,11 +113,10 @@ void handleConnection(struct connectionData *data) {
         strcat(hint, "> ");
 
         write(data->sockfd, hint, strlen(hint));
-
+        printf("SENT ARROW\n");
         if (read(data->sockfd, buffer, sizeof(buffer)) == -1) {
             fprintf(stderr, "Socker read error");
         }
-        printf(stderr, "Received message from %d: %s", data->sockfd, buffer);
 
         handleMessage(data, ltrim(buffer));
     }
@@ -117,6 +171,8 @@ void launchServer() {
         data->sockfd = connection;
         data->working = 1;
         strcpy(data->path, "/");
+        strcpy(data->realpath, SERVER_ROOT);
+        strcat(data->realpath, "/");
 
         pthread_create(&thread, NULL, handleConnection, data);
     }
