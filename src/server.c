@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 500
 
 #include <sys/socket.h>
@@ -11,7 +11,8 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <stddef.h>
-#include <sys/wait.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define SERVER_ROOT "/home/dzmitry/Desktop/serverRoot"
 
@@ -40,11 +41,58 @@ char *extractArgs(char *message) {
     return args ? args + 1 : "";
 }
 
+void list(struct connectionData *data) {
+    struct dirent** pDirent;
+
+    int total = scandir(data->realpath, &pDirent, NULL, NULL);
+
+    for(int i = 0; i < total; i++) {
+        struct stat fileinfo;
+
+        if(!strcmp(".", pDirent[i]->d_name) || !strcmp("..", pDirent[i]->d_name)) {
+            free(pDirent[i]);
+            continue;
+        }
+
+        char path[1024];
+        strcpy(path, data->realpath);
+        strcat(path, "/");
+        strcat(path, pDirent[i]->d_name);
+
+        lstat(path, &fileinfo);
+
+        char buffer[1024];
+
+        if(S_ISDIR(fileinfo.st_mode)) {
+            sprintf(buffer, "%s/\n", pDirent[i]->d_name);
+        }
+        else if(S_ISLNK(fileinfo.st_mode)) {
+            char readlinkBuffer[1024] = {0};
+            readlink(path, readlinkBuffer, sizeof(readlinkBuffer));
+            if (startsWith(readlinkBuffer, SERVER_ROOT)) {
+                sprintf(buffer, "%s --> %s\n", pDirent[i]->d_name, readlinkBuffer + strlen(SERVER_ROOT));
+            } else {
+                sprintf(buffer, "%s --> ?\n", pDirent[i]->d_name);
+            }
+        }
+        else if(S_ISREG(fileinfo.st_mode)) {
+            sprintf(buffer, "%s\n", pDirent[i]->d_name);
+        }
+
+        write(data->sockfd, buffer, strlen(buffer));
+        free(pDirent[i]);
+    }
+    if (total != -1)
+        free(pDirent);
+
+}
+
 void handleMessage(struct connectionData *data, char *message) {
     printf("Got message: %s\n", message);
     char *args = extractArgs(message);
 
     if (startsWith(message, "ECHO")) {
+        strcat(args, "\n");
         write(data->sockfd, args, strlen(args));
         printf("Sent ECHO: %s\n", args);
         return;
@@ -74,7 +122,7 @@ void handleMessage(struct connectionData *data, char *message) {
 
             char path[1024];
             realpath(new, path);
-            
+
             if (startsWith(path, SERVER_ROOT)) {
                 strcpy(data->realpath, path);
                 strcpy(data->path, path + strlen(SERVER_ROOT));
@@ -86,21 +134,42 @@ void handleMessage(struct connectionData *data, char *message) {
     }
     if (startsWith(message, "LIST")) {
         printf("Current dir for %d user is %s\n", data->sockfd, data->realpath);
-        FILE *fp;
-        char command[1024];
-        char buffer[1024];
-        strcpy(command, "/bin/ls -lah ");
-        strcat(command, data->realpath);
-        fp = popen(command, "r");
-        if (fp == NULL) {
-            fprintf(stderr, "Failed to run ls");
-        }
-        while (fgets(buffer, sizeof(buffer), fp) != NULL) {
-            write(data->sockfd, buffer, strlen(buffer));
-        }
-        pclose(fp);
+        list(data);
         printf("Successful LIST for user %d\n", data->sockfd);
         return;
+    }
+    if (startsWith(message, "@")) {
+        char filename[1024];
+        strcpy(filename, data->realpath);
+        strcat(filename, "/");
+        strcat(filename, ltrim(message + 1));
+
+        FILE *file = fopen(filename, "r");
+        printf("Opened: %s\n", filename);
+        if (file == NULL) {
+            printf("Failed to open file: %s\n", filename);
+        }
+        else {
+            while (!feof(file)) {
+                char buffer[1024] = {0};
+                fgets(buffer, sizeof(buffer), file);
+
+                if (strlen(buffer) <= 1 || feof(file)) {
+                    break;
+                }
+
+                char hint[1024] = {0};
+
+                strcpy(hint, data->path);
+                strcat(hint, "> ");
+                strcat(hint, buffer);
+                write(data->sockfd, hint, strlen(hint));
+
+                buffer[strlen(buffer) - 1] = 0;
+                handleMessage(data, buffer);
+            }
+            fclose(file);
+        }
     }
 }
 
@@ -113,11 +182,11 @@ void handleConnection(struct connectionData *data) {
         strcat(hint, "> ");
 
         write(data->sockfd, hint, strlen(hint));
-        printf("SENT ARROW\n");
-        if (read(data->sockfd, buffer, sizeof(buffer)) == -1) {
-            fprintf(stderr, "Socker read error");
-        }
 
+        if (read(data->sockfd, buffer, sizeof(buffer)) == -1) {
+            fprintf(stderr, "Socket read error");
+            data->working = 0;
+        }
         handleMessage(data, ltrim(buffer));
     }
 
@@ -131,10 +200,7 @@ void shutdownServer() {
     exit(0);
 }
 
-void launchServer() {
-    struct sigaction act = {.sa_flags = 0, .sa_handler = shutdownServer};
-    sigaction(SIGINT, &act, NULL);
-
+void launchServer(uint16_t port) {
     sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
     if (sockfd == -1) {
@@ -146,7 +212,7 @@ void launchServer() {
 
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(1337);
+    address.sin_port = htons(port);
 
     if (bind(sockfd, &address, sizeof(address)) == -1) {
         fprintf(stderr, "Failed to bind socket\n");
@@ -157,6 +223,8 @@ void launchServer() {
         fprintf(stderr, "Failed to listen socket\n");
         exit(1);
     }
+
+    printf("Waiting for connections on %hu port\n", port);
 
     while (1) {
         int connection = accept(sockfd, NULL, NULL);
@@ -178,6 +246,19 @@ void launchServer() {
     }
 }
 
-int main() {
-    launchServer();
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        printf("Use server [port]\n");
+        return 0;
+    }
+
+    uint16_t port;
+
+    if (sscanf(argv[1], "%hu", &port) != 1) {
+        printf("Port should be a positive decimal");
+    }
+
+    signal(SIGINT, shutdownServer);
+
+    launchServer(port);
 }

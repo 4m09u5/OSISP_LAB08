@@ -1,3 +1,6 @@
+#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 500
+
 #include <sys/socket.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -6,31 +9,44 @@
 #include <string.h>
 #include <strings.h>
 #include <arpa/inet.h>
+#include <signal.h>
+
 
 int sockfd;
 struct sockaddr_in address;
 pthread_t senderThread;
 pthread_t receiverThread;
 
-void sender() {
+void shutdownClient() {
+    printf("Shutting down...\n");
+    char *msg = "QUIT";
+    write(sockfd, msg, strlen(msg));
+    pthread_cancel(senderThread);
+    pthread_cancel(receiverThread);
+}
+
+void *sender() {
     while (1) {
         char buffer[1024] = {0};
         fgets(buffer, sizeof(buffer), stdin);
+        
         int sent = write(sockfd, buffer, strlen(buffer) - 1);
         if (sent == -1)  {
             fprintf(stderr, "Socket write error\n");
-            return;
+            pthread_cancel(receiverThread);
+            return NULL;
         }
     }
 }
 
-void receiver() {
+void *receiver() {
     while (1) {
         char buffer[1024] = {0};
         int received;
         if ((received = read(sockfd, buffer, sizeof(buffer) - 1)) == -1) {
             fprintf(stderr, "Socket read error\n");
-            return;
+            pthread_cancel(senderThread);
+            return NULL;
         }
         if (received == 1 && buffer[0] == 0) break;
 
@@ -41,6 +57,8 @@ void receiver() {
 
 
 int main() {
+    signal(SIGINT, shutdownClient);
+
     sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
     if (sockfd == -1) {
